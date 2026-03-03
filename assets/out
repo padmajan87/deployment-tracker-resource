@@ -1,0 +1,141 @@
+#!/bin/bash
+
+set -x
+set -e
+set -u
+set -o pipefail
+
+exec 3>&1
+exec 1>&2
+
+readonly base_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+readonly version="$(cat "${base_dir}/common/version" 2>/dev/null || echo 'unknown')"
+
+echo "Recording new deployment"
+
+readonly input_file=$(mktemp input.XXXXXX)
+
+cat > "${input_file}" <&0
+
+# Delete trailing `/`, as it can create issues when composing URLs later
+readonly endpoint=$(jq -r .source.endpoint < "${input_file}" | sed "s,/$,,")
+readonly api_token=$(jq -r .source.api_token < "${input_file}")
+readonly version_file=$(jq -r .params.version_file < "${input_file}")
+readonly environment_file=$(jq -r .params.environment_file < "${input_file}")
+readonly status_file=$(jq -r .params.status_file < "${input_file}")
+readonly metadata_file=$(jq -r .params.metadata_file < "${input_file}")
+
+readonly URL_REGEXP='https?://[-A-Za-z0-9\.]+(:[0-9]+)?'
+
+if [ -z "${endpoint}" ]; then
+    echo "Invalid payload: missing 'endpoint'"
+    exit 1
+elif ! [[ "${endpoint}" =~ ${URL_REGEXP} ]]; then 
+    echo "Invalid payload: the value '${endpoint}' for 'endpoint' is not valid; endpoint must match the following regex: ${URL_REGEXP}"
+    exit 1
+fi
+
+if [ -z "${api_token}" ]; then
+    echo "Invalid payload: missing 'api_token'"
+    exit 1
+fi
+
+if [ "${version_file}" != null ]; then
+    if [ -f "${version_file}" ]; then
+        deployment_version="$(cat "${version_file}")"
+    else
+        echo "The version file '${version_file}' does not exist"
+        exit 1
+    fi
+else
+    deployment_version="${BUILD_PIPELINE_NAME}/${BUILD_NAME} #${BUILD_ID}"
+fi
+
+if [ "${environment_file}" != null ]; then
+    if [ -f "${environment_file}" ]; then
+        deployment_environment="$(cat "${environment_file}")"
+    else
+        echo "The environment file '${environment_file}' does not exist"
+        exit 1
+    fi
+else
+    deployment_environment="dev"
+fi
+
+if [ "${status_file}" != null ]; then
+    if [ -f "${status_file}" ]; then
+        deployment_status="$(cat "${status_file}")"
+    else
+        echo "The status file '${status_file}' does not exist"
+        exit 1
+    fi
+else
+    deployment_status="success"
+fi
+
+readonly deployment_timestamp="$(date +%s)000"
+
+if [ "${metadata_file}" != null ]; then
+    if [ -f "${metadata_file}" ]; then
+        if ! JSON_TYPE=$(jq -r type < "${metadata_file}"); then
+            echo "The content of the '${metadata_file}' metadata file is not valid JSON:"
+            echo "${JSON_TYPE}"
+            exit 1
+        fi
+
+        if [ "${JSON_TYPE}" != 'object' ]; then
+            echo "Wrong JSON type contained in the '${metadata_file}' metadata file; expected 'object', found '${JSON_TYPE}'"
+            exit 1
+        fi
+
+        metadata=$(cat "${metadata_file}")
+    else
+        echo "The metadata file '${metadata_file}' does not exist"
+        exit 1
+    fi
+fi
+
+echo "Using the API endpoint: ${endpoint}/api/deployments"
+
+if ! deployment=$(curl --silent --show-error --fail -X POST --header 'Content-Type: application/json' --user-agent "instana/deployment-tracker-resource/${version}" --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments" -d "{
+    \"version\": \"${deployment_version}\",
+    \"environment\": \"${deployment_environment}\",
+    \"status\": \"${deployment_status}\",
+    \"timestamp\": ${deployment_timestamp},
+    \"metadata\": ${metadata:-null}
+}"); then
+    echo 'Cannot create the deployment record'
+    exit 1
+fi
+
+readonly deployment_id=$(echo "${deployment}" | jq -r '.id')
+readonly deployment_version_returned=$(echo "${deployment}" | jq -r '.version')
+readonly deployment_environment_returned=$(echo "${deployment}" | jq -r '.environment')
+readonly deployment_status_returned=$(echo "${deployment}" | jq -r '.status')
+readonly deployment_timestamp_returned=$(echo "${deployment}" | jq -r '.timestamp')
+
+echo "Created deployment '${deployment_version_returned}' to '${deployment_environment_returned}' with ID '${deployment_id}'"
+
+jq -n "{
+    \"version\": {
+        \"deployment\": \"${deployment_id}\"
+    },
+    \"metadata\": [
+        {
+            \"name\": \"version\",
+            \"value\": \"${deployment_version_returned}\"
+        },
+        {
+            \"name\": \"environment\",
+            \"value\": \"${deployment_environment_returned}\"
+        },
+        {
+            \"name\": \"status\",
+            \"value\": \"${deployment_status_returned}\"
+        },
+        {
+            \"name\": \"timestamp\",
+            \"value\": \"${deployment_timestamp_returned}\"
+        }
+    ]
+}" >&3

@@ -1,0 +1,80 @@
+#!/bin/bash
+
+set -x
+set -e
+set -u
+set -o pipefail
+
+exec 3>&1
+exec 1>&2
+
+readonly base_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+readonly version="$(cat "${base_dir}/common/version" 2>/dev/null || echo 'unknown')"
+
+echo "Retrieving latest deployment"
+
+readonly input_file=$(mktemp input.XXXXXX)
+
+cat > "${input_file}" <&0
+
+# Delete trailing `/`, as it can create issues when composing URLs later
+readonly endpoint=$(jq -r .source.endpoint < "${input_file}" | sed "s,/$,,")
+readonly api_token=$(jq -r .source.api_token < "${input_file}")
+readonly environment=$(jq -r .source.environment < "${input_file}" || echo 'all')
+
+readonly latest_deployment_id=$(jq -re .version.deployment < "${input_file}" || echo '')
+
+readonly URL_REGEXP='https?://[-A-Za-z0-9\.]+(:[0-9]+)?'
+
+if [ -z "${endpoint}" ]; then
+    echo "Invalid payload: missing 'endpoint'"
+    exit 1
+elif ! [[ "${endpoint}" =~ ${URL_REGEXP} ]]; then 
+    echo "Invalid payload: the value '${endpoint}' for 'endpoint' is not valid; endpoint must match the following regex: ${URL_REGEXP}"
+    exit 1
+fi
+
+if [ -z "${api_token}" ]; then
+    echo "Invalid payload: missing 'api_token'"
+    exit 1
+fi
+
+echo "Using the API endpoint: ${endpoint}/api/deployments"
+
+if [ "${latest_deployment_id}" = null ]; then
+    echo 'No deployment id provided in input (is it the first time this resource is fetched?); retrieving the latest deployment'
+
+    curl --silent --show-error --fail \
+        --user-agent "instana/deployment-tracker-resource/${version}" \
+        --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments?environment=${environment}" \
+        | jq -er '[ sort_by(.timestamp) | reverse | first | select(. != null) | {deployment: .id} ]' >&3
+
+    exit 0;
+fi
+
+echo -n "Looking up timestamp of the '${latest_deployment_id}' ... "
+output_file=$(mktemp latest_deployment.XXXXXX)
+
+if status=$(curl --silent --show-error --fail --output "${output_file}" --write-out '%{http_code}' --user-agent "instana/deployment-tracker-resource/${version}" --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments/${latest_deployment_id}"); then
+    deployment_timestamp=$(jq -er '.timestamp' < "${output_file}")
+    normalized_timestamp="${deployment_timestamp:0:${#deployment_timestamp}-3}"
+    timestamp_date="$(date -d @${normalized_timestamp} 2>/dev/null || date -r ${normalized_timestamp} 2>/dev/null)"
+    echo "${timestamp_date}"
+
+    echo -n "Retrieving all deployments at or after ${timestamp_date}"
+
+    curl --silent --show-error --fail --user-agent "instana/deployment-tracker-resource/${version}" --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments?from=${deployment_timestamp}&environment=${environment}" \
+        | jq -er '[ sort_by(.timestamp) | reverse[] | {deployment: .id} ]' >&3
+
+    exit 0;
+fi
+
+if [ "${status}" != '404' ]; then
+    exit 1;
+fi
+
+echo 'Deployment not found'
+echo 'Fetching the latest deployment instead'
+
+curl --silent --show-error --fail --user-agent "instana/deployment-tracker-resource/${version}" --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments?environment=${environment}" \
+    | jq -er '[ sort_by(.timestamp) | reverse | first | select(. != null) | {deployment: .id} ]' >&3

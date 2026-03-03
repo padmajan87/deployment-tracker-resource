@@ -1,0 +1,100 @@
+#!/bin/bash
+
+set -x
+set -e
+set -u
+set -o pipefail
+
+exec 3>&1
+exec 1>&2
+
+readonly base_dir="$( cd "$( dirname "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+readonly version="$(cat "${base_dir}/common/version" 2>/dev/null || echo 'unknown')"
+
+echo "Retrieving latest deployment"
+
+readonly destination=$1
+
+if [ -z "${destination}" ]; then
+  echo "usage: $0 <path/to/destination>" >&2
+  exit 1
+fi
+
+mkdir -p "${destination}"
+
+readonly input_file=$(mktemp input.XXXXXX)
+
+cat > "${input_file}" <&0
+
+# Delete trailing `/`, as it can create issues when composing URLs later
+readonly endpoint=$(jq -r .source.endpoint < "${input_file}" | sed "s,/$,,")
+readonly api_token=$(jq -r .source.api_token < "${input_file}")
+
+readonly deployment_id=$(jq -r .version.deployment < "${input_file}")
+
+readonly URL_REGEXP='https?://[-A-Za-z0-9\.]+(:[0-9]+)?'
+
+if [ -z "${endpoint}" ]; then
+  echo "Invalid payload: missing 'endpoint'"
+  exit 1
+elif ! [[ "${endpoint}" =~ ${URL_REGEXP} ]]; then 
+  echo "Invalid payload: the value '${endpoint}' for 'endpoint' is not valid; endpoint must match the following regex: ${URL_REGEXP}"
+  exit 1
+fi
+
+if [ -z "${api_token}" ]; then
+  echo "Invalid payload: missing 'api_token'"
+  exit 1
+fi
+
+if [ "${deployment_id}" = 'null' ]; then
+  echo "Invalid payload: missing 'deployment'"
+  exit 1
+fi
+
+echo "Using the API endpoint: ${endpoint}/api/deployments"
+
+echo -n "Retrieving deployment '${deployment_id}' ... "
+
+if ! deployment=$(curl --silent --show-error --fail --user-agent "instana/deployment-tracker-resource/${version}" --header "Authorization: apiToken ${api_token}" "${endpoint}/api/deployments/${deployment_id}"); then
+  exit 1
+fi
+
+echo 'OK'
+echo "Deployment '${deployment_id}':"
+echo "${deployment}" | jq '.'
+
+readonly deployment_version=$(echo "${deployment}" | jq -r '.version')
+readonly deployment_environment=$(echo "${deployment}" | jq -r '.environment')
+readonly deployment_status=$(echo "${deployment}" | jq -r '.status')
+readonly deployment_timestamp=$(echo "${deployment}" | jq -r '.timestamp')
+
+echo "${deployment_id}" > "${destination}/deployment_id"
+echo "${deployment_version}" > "${destination}/version"
+echo "${deployment_environment}" > "${destination}/environment"
+echo "${deployment_status}" > "${destination}/status"
+echo "${deployment_timestamp}" > "${destination}/timestamp"
+
+jq -n "{
+  \"version\": {
+    \"deployment\": \"${deployment_id}\"
+  },
+  \"metadata\": [
+    {
+      \"name\": \"version\",
+      \"value\": \"${deployment_version}\"
+    },
+    {
+      \"name\": \"environment\",
+      \"value\": \"${deployment_environment}\"
+    },
+    {
+      \"name\": \"status\",
+      \"value\": \"${deployment_status}\"
+    },
+    {
+      \"name\": \"timestamp\",
+      \"value\": \"${deployment_timestamp}\"
+    }
+  ]
+}" >&3
